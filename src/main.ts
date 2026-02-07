@@ -1,99 +1,536 @@
-import {App, Editor, MarkdownView, Modal, Notice, Plugin} from 'obsidian';
-import {DEFAULT_SETTINGS, MyPluginSettings, SampleSettingTab} from "./settings";
+import { Plugin, TFile, Notice, requestUrl, normalizePath } from 'obsidian';
+import { LinkMonitorSettings, DEFAULT_SETTINGS, LinkMonitorSettingTab } from './settings';
 
-// Remember to rename these classes and interfaces!
-
-export default class MyPlugin extends Plugin {
-	settings: MyPluginSettings;
+export default class LinkMonitorPlugin extends Plugin {
+	settings: LinkMonitorSettings;
+	private processedLinks = new Set<string>();
+	private statusBarItem: HTMLElement;
+	private inProgressCount = 0;
+	protected stabilityThresholdMs = 2000;
+	private _isUnloaded = false;
 
 	async onload() {
 		await this.loadSettings();
 
-		// This creates an icon in the left ribbon.
-		this.addRibbonIcon('dice', 'Sample', (evt: MouseEvent) => {
-			// Called when the user clicks the icon.
-			new Notice('This is a notice!');
-		});
+		this.statusBarItem = this.addStatusBarItem();
+		this.updateStatusBar();
 
-		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		const statusBarItemEl = this.addStatusBarItem();
-		statusBarItemEl.setText('Status bar text');
+		this.addSettingTab(new LinkMonitorSettingTab(this.app, this));
 
-		// This adds a simple command that can be triggered anywhere
+		// Add file watchers to trigger processing on file changes (debounced)
+		this.registerFileWatchers();
+
+		// Add command to manually trigger processing
 		this.addCommand({
-			id: 'open-modal-simple',
-			name: 'Open modal (simple)',
-			callback: () => {
-				new SampleModal(this.app).open();
-			}
-		});
-		// This adds an editor command that can perform some operation on the current editor instance
-		this.addCommand({
-			id: 'replace-selected',
-			name: 'Replace selected content',
-			editorCallback: (editor: Editor, view: MarkdownView) => {
-				editor.replaceSelection('Sample editor command');
-			}
-		});
-		// This adds a complex command that can check whether the current state of the app allows execution of the command
-		this.addCommand({
-			id: 'open-modal-complex',
-			name: 'Open modal (complex)',
-			checkCallback: (checking: boolean) => {
-				// Conditions to check
-				const markdownView = this.app.workspace.getActiveViewOfType(MarkdownView);
-				if (markdownView) {
-					// If checking is true, we're simply "checking" if the command can be run.
-					// If checking is false, then we want to actually perform the operation.
-					if (!checking) {
-						new SampleModal(this.app).open();
-					}
-
-					// This command will only show up in Command Palette when the check function returns true
-					return true;
-				}
-				return false;
-			}
+			id: 'process-links',
+			name: 'Process link bookmark file',
+			callback: () => this.processLinks()
 		});
 
-		// This adds a settings tab so the user can configure various aspects of the plugin
-		this.addSettingTab(new SampleSettingTab(this.app, this));
-
-		// If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
-		// Using this function will automatically remove the event listener when this plugin is disabled.
-		this.registerDomEvent(document, 'click', (evt: MouseEvent) => {
-			new Notice("Click");
-		});
-
-		// When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-		this.registerInterval(window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000));
-
+		// Run a first pass
+		await this.processLinks();
 	}
 
 	onunload() {
+		if (this.bookmarkProcessTimer) {
+			clearTimeout(this.bookmarkProcessTimer);
+			this.bookmarkProcessTimer = null;
+		}
+		this._isUnloaded = true;
 	}
 
 	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData() as Partial<MyPluginSettings>);
+		const loaded = (await this.loadData()) as Partial<LinkMonitorSettings> | undefined;
+
+		this.settings = { ...DEFAULT_SETTINGS, ...(loaded || {}) };
+		this.stabilityThresholdMs = (this.settings.stabilityThresholdSeconds || 2) * 1000;
 	}
 
 	async saveSettings() {
 		await this.saveData(this.settings);
 	}
-}
 
-class SampleModal extends Modal {
-	constructor(app: App) {
-		super(app);
+	private extractLinksFromMarkdown(content: string): Array<{ raw: string; url: string; line: number }> {
+		const links: Array<{ raw: string; url: string; line: number }> = [];
+		const lines = content.split('\n');
+
+		lines.forEach((line, index) => {
+			// Find markdown links: [text](url)
+			const markdownLinks = line.matchAll(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g);
+			for (const match of markdownLinks) {
+				const url = match[2];
+				if (url && this.isValidHttpLink(url) && !this.isBlockedDomain(url)) {
+					links.push({
+						raw: match[0],
+						url: url,
+						line: index + 1
+					});
+				}
+			}
+
+			// Find bare URLs
+			const bareUrls = line.matchAll(/(https?:\/\/[^\s]+)/g);
+			for (const match of bareUrls) {
+				const url = match[1];
+				if (url && this.isValidHttpLink(url) && !this.isBlockedDomain(url)) {
+					// Check if this URL is already captured as a markdown link
+					const alreadyCaptured = links.some(link => link.url === url && link.line === index + 1);
+					if (!alreadyCaptured) {
+						links.push({
+							raw: url,
+							url: url,
+							line: index + 1
+						});
+					}
+				}
+			}
+		});
+
+		return links;
 	}
 
-	onOpen() {
-		let {contentEl} = this;
-		contentEl.setText('Woah!');
+	private isValidHttpLink(link: string): boolean {
+		try {
+			const url = new URL(link);
+			return url.protocol === 'http:' || url.protocol === 'https:';
+		} catch {
+			return false;
+		}
 	}
 
-	onClose() {
-		const {contentEl} = this;
-		contentEl.empty();
+	private isBlockedDomain(link: string): boolean {
+		const blockedDomains = this.settings.blockedDomains.split(',').map(d => d.trim());
+
+		try {
+			const host = new URL(link).hostname.toLowerCase();
+			return blockedDomains.some((blocked) => host === blocked || host.endsWith(`.${blocked}`));
+		} catch {
+			return false;
+		}
+	}
+
+	// Minimum idle time after edits before processing (ms)
+	private bookmarkProcessTimer: ReturnType<typeof setTimeout> | null = null;
+
+	private scheduleProcessingForBookmark(immediate = false): void {
+		if (this._isUnloaded) return;
+		// If immediate, cancel any pending timer and run now
+		if (immediate) {
+			if (this.bookmarkProcessTimer) {
+				clearTimeout(this.bookmarkProcessTimer);
+				this.bookmarkProcessTimer = null;
+			}
+			void this.processLinks();
+			return;
+		}
+
+		// Otherwise schedule processing after stabilityThresholdMs of inactivity
+		if (this.bookmarkProcessTimer) {
+			clearTimeout(this.bookmarkProcessTimer);
+		}
+		this.bookmarkProcessTimer = setTimeout(() => {
+			this.bookmarkProcessTimer = null;
+			void this.processLinks();
+		}, this.stabilityThresholdMs);
+	}
+
+	private registerFileWatchers(): void {
+		const bookmarkFilePath = normalizePath(this.settings.linkBookmarkFilePath);
+		// Watch for modifications and creations of the link bookmark file
+		this.registerEvent(this.app.vault.on('modify', (file) => {
+			if (!(file instanceof TFile)) return;
+
+			if (file.path === bookmarkFilePath) {
+				this.scheduleProcessingForBookmark();
+			}
+
+			if (this.settings.watchDailyNote) {
+				const dailyPath = this.getDailyNotePath();
+				if (file.path === dailyPath) {
+					this.scheduleProcessingForBookmark();
+				}
+			}
+		}));
+
+		this.registerEvent(this.app.vault.on('create', (file) => {
+			if (!(file instanceof TFile)) return;
+
+			if (file.path === bookmarkFilePath) {
+				this.scheduleProcessingForBookmark();
+			}
+
+			if (this.settings.watchDailyNote) {
+				const dailyPath = this.getDailyNotePath();
+				if (file.path === dailyPath) {
+					this.scheduleProcessingForBookmark();
+				}
+			}
+		}));
+
+
+	}
+
+	private async processLinks() {
+		if (this._isUnloaded) return;
+		if (!this.settings.useExternalService) {
+			new Notice('External processing is disabled. Enable "use external service" in plugin settings to process links.');
+			return;
+		}
+		const bookmarkFilePath = normalizePath(this.settings.linkBookmarkFilePath);
+		const bookmarkFile = this.findBookmarkFile(bookmarkFilePath);
+
+		// Read bookmark file content (treat missing file as empty content)
+		let bookmarkContent = '';
+		if (bookmarkFile instanceof TFile) {
+			bookmarkContent = await this.app.vault.read(bookmarkFile);
+		}
+		let allLinks: Array<{ raw: string; url: string; line: number; file: TFile | null; content: string }> = this.extractLinksFromMarkdown(bookmarkContent).map(l => ({ ...l, file: bookmarkFile, content: bookmarkContent }));
+		// If watching daily note, include it too
+		if (this.settings.watchDailyNote) {
+			try {
+				const dailyPath = this.getDailyNotePath();
+				const dailyFile = this.app.vault.getAbstractFileByPath(dailyPath) as TFile | null;
+				if (dailyFile instanceof TFile) {
+					const dailyContent = await this.app.vault.read(dailyFile);
+					const dailyLinks = this.extractLinksFromMarkdown(dailyContent).map(l => ({ ...l, file: dailyFile, content: dailyContent }));
+					allLinks = allLinks.concat(dailyLinks);
+				}
+			} catch (e) {
+				console.error('Failed to include daily note links:', e);
+			}
+		}
+
+		// Filter to only new links and skip links already checked in their respective files
+		const pending = allLinks.filter(link => {
+			if (this.processedLinks.has(link.url)) return false;
+			if (this.isLinkChecked(link.content, link)) {
+				return false;
+			}
+			return true;
+		});
+
+		if (pending.length === 0) return;
+
+		for (const link of pending) {
+			try {
+				console.warn(`Processing link: ${link.url}`);
+				this.inProgressCount++;
+				this.updateStatusBar();
+				await this.processLink(link.url);
+				this.inProgressCount--;
+				this.updateStatusBar();
+				this.processedLinks.add(link.url);
+				// Mark all occurrences of the link as checked in its source file (only if a source file exists)
+				if (link.file instanceof TFile) {
+					try {
+						await this.markLinkChecked(link.file, link.url);
+					} catch (e) {
+						console.error(`Failed to mark link checked for ${link.url}:`, e);
+					}
+				}
+				new Notice(`✓ Processed: ${link.url}`);
+			} catch (error) {
+				console.error(`Failed to process ${link.url}:`, error);
+				this.inProgressCount--;
+				this.updateStatusBar();
+				// Still mark as processed to avoid repeated failures
+				this.processedLinks.add(link.url);
+				new Notice(`✗ Failed to process: ${link.url}`);
+			}
+		}
+	}
+
+	private updateStatusBar() {
+		this.statusBarItem.setText(`🔗 ${this.inProgressCount}`);
+	}
+
+	private async processLink(url: string): Promise<void> {
+		await this.processLinkWithLavaServer(url);
+	}
+
+	private async processLinkWithLavaServer(url: string): Promise<void> {
+		const requestBody = {
+			links: [url],
+			returnFormat: 'md',
+			parser: this.settings.parserType,
+			saveToDisk: false
+		};
+
+		const requestHeaders: Record<string, string> = {
+			'Content-Type': 'application/json',
+			'Accept': 'text/markdown'
+		};
+
+		const response = await requestUrl({
+			url: this.settings.lavaServerUrl,
+			method: 'POST',
+			headers: requestHeaders,
+			body: JSON.stringify(requestBody)
+		});
+
+		// Safe JSON/text preview
+		try {
+			const contentType = String(response.headers?.['content-type'] || '');
+			if (/application\/(json|ld\+json)/i.test(contentType)) {
+				// JSON content detected, but not processing it here
+			}
+		} catch {
+			// JSON parsing not used
+		}
+
+		if (response.status !== 200) {
+			throw new Error(`lava server returned status ${response.status}`);
+		}
+
+		const markdown = response.text;
+		if (!markdown || markdown.trim() === '') {
+			throw new Error('lava server returned empty content');
+		}
+
+		// Fix relative image paths in markdown
+		let fixedMarkdown = this.fixImagePaths(markdown, url);
+
+		// Extract title from frontmatter (if present) or first heading
+		const title = this.extractTitleFromMarkdown(fixedMarkdown) || 'Untitled';
+
+		// Ensure clipping folder exists
+		const clippingFolderPath = normalizePath(this.settings.clippingFolder);
+		const clippingFolder = this.app.vault.getAbstractFileByPath(clippingFolderPath);
+		if (!clippingFolder) {
+			await this.app.vault.createFolder(clippingFolderPath);
+		}
+
+		// Ensure frontmatter exists and contains at least title and source
+		const frontmatterObj: Record<string, string | string[]> = {
+			title: title,
+			source: url,
+			url: url,
+			clipped: new Date().toISOString().split('T')[0]!,
+			tags: this.settings.defaultTags.split(',').map(t => t.trim())
+		};
+
+		fixedMarkdown = this.ensureFrontmatter(fixedMarkdown, frontmatterObj);
+
+		// Create the clipping file (overwrite if exists)
+		const baseName = this.sanitizeFileName(title);
+		const fileName = baseName + '.md';
+		const filePath = `${clippingFolderPath}/${fileName}`;
+
+		const existingFile = this.app.vault.getAbstractFileByPath(filePath);
+		if (existingFile instanceof TFile) {
+			await this.app.vault.process(existingFile, () => fixedMarkdown);
+		} else {
+			await this.app.vault.create(filePath, fixedMarkdown);
+		}
+	}
+
+	private fixImagePaths(content: string, baseUrl: string): string {
+		// Normalize baseUrl so that relative paths resolve against the directory when appropriate
+		let normalizedBase = baseUrl;
+		try {
+			const urlObj = new URL(baseUrl);
+			const lastSegment = urlObj.pathname.split('/').filter(Boolean).pop() || '';
+			if (!urlObj.pathname.endsWith('/') && lastSegment && !lastSegment.includes('.')) {
+				urlObj.pathname = urlObj.pathname + '/';
+				normalizedBase = urlObj.href;
+			}
+		} catch {
+			// If parsing fails, fall back to the original baseUrl
+		}
+
+		return content.replace(
+			/!\[([^\]]*)\]\((?!https?:\/\/)([^)]*)\)/g,
+			(match, alt, path) => {
+				try {
+					const resolved = new URL(String(path), normalizedBase).href;
+					return `![${alt}](${resolved})`;
+				} catch {
+					return match;
+				}
+			}
+		);
+	}
+
+	private sanitizeFileName(name: string): string {
+		return name.replace(/[/\\?%*:|"<>]/g, '-').replace(/\s+/g, '_');
+	}
+
+	// Computes the daily note path using user settings
+	private getDailyNotePath(date: Date = new Date()): string {
+		const y = date.getFullYear();
+		const mm = String(date.getMonth() + 1).padStart(2, '0');
+		const dd = String(date.getDate()).padStart(2, '0');
+		let name = this.settings.dailyNoteFormat.replace(/YYYY/g, String(y)).replace(/MM/g, mm).replace(/DD/g, dd);
+		if (!name.endsWith('.md')) name = `${name}.md`;
+		const path = this.settings.dailyNotePath ? `${this.settings.dailyNotePath}/${name}` : name;
+		return normalizePath(path);
+	}
+
+	// Find the bookmark file using normalized path, raw configured path, or case-insensitive scan
+	private findBookmarkFile(bookmarkFilePath: string): TFile | null {
+		// Try normalized path first
+		const normalized = bookmarkFilePath;
+		let f = this.app.vault.getAbstractFileByPath(normalized) as TFile | null;
+		if (f instanceof TFile) return f;
+
+		// Try the raw configured path
+		f = this.app.vault.getAbstractFileByPath(this.settings.linkBookmarkFilePath) as TFile | null;
+		if (f instanceof TFile) return f;
+
+		// Fallback: case-insensitive match against vault files
+		const files = this.app.vault.getFiles();
+		const targetLower = normalizePath(normalized).toLowerCase();
+		return files.find(file => normalizePath(file.path).toLowerCase() === targetLower) || null;
+	}
+
+	// Extracts a title from markdown response. Prefers frontmatter title, then first H1
+	private extractTitleFromMarkdown(markdown: string): string | null {
+		try {
+			const fmMatch = markdown.match(/^---\s*([\s\S]*?)\s*---/m);
+			if (fmMatch) {
+				const fm = fmMatch[1];
+				if (fm) {
+					const titleMatch = fm.match(/title:\s*(?:"([^"]+)"|'([^']+)'|([^\n]+))/i);
+					if (titleMatch) {
+						const title = titleMatch[1] || titleMatch[2] || titleMatch[3];
+						if (title) {
+							return title.trim();
+						}
+					}
+				}
+			}
+
+			const h1Match = markdown.match(/^#\s+(.+)$/m);
+			if (h1Match && h1Match[1]) return h1Match[1].trim();
+			return null;
+		} catch {
+			return null;
+		}
+	}
+
+	// Ensures markdown contains a minimal frontmatter block. If frontmatter exists, returns original markdown.
+	private ensureFrontmatter(markdown: string, fmObj: Record<string, string | string[]>): string {
+		try {
+			if (/^---\s*[\s\S]*?\s*---/m.test(markdown)) {
+				// Already has frontmatter; do not modify
+				return markdown;
+			}
+
+			const fmLines: string[] = [];
+			for (const [key, value] of Object.entries(fmObj)) {
+				if (Array.isArray(value)) {
+					const arr = value.map(v => `"${String(v).replace(/"/g, '\\"')}"`).join(', ');
+					fmLines.push(`${key}: [${arr}]`);
+				} else if (typeof value === 'string') {
+					fmLines.push(`${key}: "${value.replace(/"/g, '\\"')}"`);
+				} else {
+					fmLines.push(`${key}: ${String(value)}`);
+				}
+			}
+
+			const fmBlock = `---\n${fmLines.join('\n')}\n---\n\n`;
+
+			// If no H1 in markdown, add one using title
+			const hasH1 = /^#\s+/m.test(markdown);
+			const title = Array.isArray(fmObj.title) ? fmObj.title.join(' ') : (fmObj.title || '');
+			const titleLine = !hasH1 && title ? `# ${title}\n\n` : '';
+
+			return fmBlock + titleLine + markdown;
+		} catch {
+			return markdown;
+		}
+	}
+
+	private async sleep(ms: number): Promise<void> {
+		return new Promise(resolve => setTimeout(resolve, ms));
+	}
+
+	// Ensure that all parent folders for a given file path exist in the vault
+	private async ensureParentFolders(filePath: string): Promise<void> {
+		try {
+			const parts = filePath.split('/').slice(0, -1);
+			if (parts.length === 0) return;
+
+			let current = '';
+			for (const part of parts) {
+				current = current ? `${current}/${part}` : part;
+				const existing = this.app.vault.getAbstractFileByPath(current);
+				if (!existing) {
+					try {
+						await this.app.vault.createFolder(current);
+
+					} catch (err) {
+						// If folder creation fails because it already exists concurrently, ignore
+						const msg = err instanceof Error ? err.message : String(err);
+						if (msg.includes('already exists') || msg.includes('File already exists')) {
+							continue;
+						}
+						throw err;
+					}
+				}
+			}
+		} catch (error) {
+			console.error('ensureParentFolders failed:', error);
+		}
+	}
+
+	// Marks all occurrences of the specified URL as checked in the given file.
+	private async markLinkChecked(file: TFile, url: string): Promise<void> {
+		try {
+			await this.app.vault.process(file, (content) => {
+				const lines = content.split('\n');
+				let modified = false;
+
+				for (let i = 0; i < lines.length; i++) {
+					const line = lines[i]!;
+
+					// Skip if already checked
+					if (/\[\s*[xX]\s*\]/.test(line)) continue;
+
+					// Check if this line contains the URL
+					if (line.includes(url)) {
+						// Detect leading bullet if any
+						const bulletMatch = line.match(/^(\s*[-*+]\s*)(.*)$/);
+						let newLine: string;
+						if (bulletMatch) {
+							const bullet = bulletMatch[1];
+							const rest = bulletMatch[2] || '';
+							// If rest starts with a checkbox, replace it
+							const restCheckboxMatch = rest.match(/^\[\s*[xX\s]?\s*\]\s*(.*)$/);
+							if (restCheckboxMatch) {
+								newLine = `${bullet}[x] ${restCheckboxMatch[1]}`;
+							} else {
+								newLine = `${bullet}[x] ${rest}`;
+							}
+						} else {
+							// No bullet; prefix with a checkbox bullet
+							newLine = `- [x] ${line.trim()}`;
+						}
+
+						lines[i] = newLine;
+						modified = true;
+					}
+				}
+
+				return modified ? lines.join('\n') : content;
+			});
+		} catch {
+			// Silently fail
+			console.error('markLinkChecked failed');
+		}
+	}
+
+	// Returns true if the provided link is already marked checked in the file content
+	private isLinkChecked(fileContent: string, link: { raw: string; url: string; line: number }): boolean {
+		try {
+			const lines = fileContent.split('\n');
+			const idx = Math.max(0, Math.min(lines.length - 1, link.line - 1));
+			const line = lines[idx] || '';
+			const checkboxRegex = /\[\s*[xX]\s*\]/;
+
+			return checkboxRegex.test(line);
+		} catch {
+			return false;
+		}
 	}
 }
